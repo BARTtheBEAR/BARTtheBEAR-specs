@@ -16,6 +16,7 @@ Goals:
 - Revocations use the same structure — no parallel schema
 - Meta-attestation (trust-in-attesters) is supported but depth-capped
 - No infinite regress — termination condition is built in
+- **Write authority is enforced at the contract level — self-attestation is structurally prevented**
 
 ---
 
@@ -62,6 +63,67 @@ Domains are 4-byte identifiers scoped to specialization areas:
 | `meta`       | `0x6d657461` | Meta-attestation (attester credibility) |
 
 New domains can be proposed via governance. Domain bytes should be human-readable ASCII where possible.
+
+---
+
+## Write Authority
+
+**Self-attestation is not a valid attestation.** The core problem: if an agent writes ERC725Y entries to its own UP, the data is self-reported. It may reflect real behavior, but the schema carries no enforcement guarantee. Any indexer treating self-written entries as authoritative is trusting the agent's word, not a verified on-chain event.
+
+### Enforced Write Authority Model
+
+Attestation writes MUST originate from a **settlement contract** — a contract the subject cannot unilaterally control. The settlement contract is the only authorized writer of attestation data keys to any UP.
+
+**Rules:**
+1. The settlement contract holds LSP6 `SETDATA` permission on the subject's UP, scoped to attestation key prefixes only
+2. The attesting agent submits an attestation transaction to the settlement contract — it does not write to the subject's UP directly
+3. The settlement contract validates the attestation (domain, depth, anti-self-attestation check) and executes the `setData` call
+4. Attestation data written by any address other than the authorized settlement contract MUST be ignored by indexers
+
+**Anti-self-attestation check (enforced in settlement contract):**
+```solidity
+require(msg.sender != subject, "Self-attestation not permitted");
+```
+
+**Key prefix scoping (LSP6 AllowedERC725YDataKeys):**
+```
+attestation key prefix: keccak256("AttestationSchema") & 0xFFFFFFFF00000000...
+```
+The settlement contract's LSP6 permission is restricted to this prefix. It cannot write arbitrary data to the UP.
+
+---
+
+## Settlement Contract Governance
+
+The settlement contract is the trust anchor for the entire schema. Its governance model determines whether attestations are credible.
+
+### Requirements
+
+1. **No unilateral upgrade** — the settlement contract must be owned by a timelock or governance contract, not an EOA or single agent
+2. **Immutable core logic** — attestation validation rules (depth cap, anti-self-attestation, domain whitelist) should be in a non-upgradeable base contract
+3. **Governed parameter surface** — only domain registry additions, score normalization parameters, and seed trust additions go through governance
+4. **Auditable write log** — every `setData` call through the settlement contract emits an event with attester, subject, domain, score, and timestamp
+
+### Governance Architecture (Proposed)
+
+```
+CouncilGovernor
+    └── CouncilTimelock (minDelay: 48h)
+            └── AttestationSettlementContract (owner: Timelock)
+                    └── setData() on subject UPs (scoped LSP6 permission)
+```
+
+- Settlement contract parameters (domain whitelist, depth cap) are only changeable via timelock-executed governance proposal
+- Emergency pause (if implemented) requires a 2-of-N multisig with council members as signers — no single agent can pause unilaterally
+- Seed trust additions require a governance vote, not a contract owner call
+
+### LSP6 Permission Scoping for Settlement Contract
+
+The settlement contract address must be added as a controller on each participating UP with:
+- Permission: `SETDATA`
+- `AllowedERC725YDataKeys`: restricted to attestation key prefix only
+
+This is a one-time setup per UP. Agents opt in to the attestation system by granting this scoped permission. Opting out = revoking the permission.
 
 ---
 
@@ -148,6 +210,7 @@ Indexers consuming this schema MUST:
 4. Apply depth-based weight decay when aggregating scores
 5. Ignore depth ≥ 3 entries for scoring purposes (still valid on-chain)
 6. Treat `score = 0` as revocation regardless of original score
+7. **Reject any attestation entry not written by the authorized settlement contract address**
 
 ---
 
@@ -164,6 +227,8 @@ Indexers consuming this schema MUST:
 5. **Seed trust governance** — who ratifies the first set of seed trust agents? Bootstrapping problem. Proposal: initial seed set is set at contract deploy time by the deployer, then governance takes over.
 
 6. **URD triggering** — does the URD write attestation data to the *attester's* UP or the *subject's* UP? Writing to the attester's UP is safer (no unsolicited data on a subject's profile), but makes subject-centric queries harder.
+
+7. **Settlement contract deployment** — who deploys it, and under what initial ownership? Pre-governance bootstrapping requires a trusted deployer. Propose: deployer transfers ownership to timelock in the same transaction.
 
 ---
 
