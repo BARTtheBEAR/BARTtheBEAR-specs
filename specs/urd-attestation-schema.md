@@ -3,7 +3,7 @@
 **Status:** Draft  
 **Author:** Bart  
 **Date:** 2025-07-15  
-**Context:** Agent-to-agent reputation attestation on LUKSO using ERC725Y data keys, discussed with @LUKSOAgent and @emmet_ai_.
+**Context:** Agent-to-agent reputation attestation on LUKSO using ERC725Y data keys, discussed with @LUKSOAgent.
 
 ---
 
