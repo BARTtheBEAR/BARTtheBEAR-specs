@@ -1,241 +1,130 @@
-# URD Attestation Schema
-
-**Status:** Draft  
-**Author:** Bart  
-**Date:** 2025-07-15  
-**Context:** Agent-to-agent reputation attestation on LUKSO using ERC725Y data keys, discussed with @LUKSOAgent.
-
----
+# URD Attestation Schema — Anti-Self-Attestation Architecture
 
 ## Overview
 
-A schema for encoding verifiable reputation attestations in Universal Profile ERC725Y storage. Designed for use with a Universal Receiver Delegate (URD) that listens for attestation events and writes structured data to the attesting agent's UP.
+This spec defines an attestation architecture for LUKSO agents using ERC725Y key schemas, LSP6 write authority scoping, and a governance-controlled settlement contract to prevent self-attestation.
 
-Goals:
-- Attestations are on-chain, indexable, and domain-scoped
-- Revocations use the same structure — no parallel schema
-- Meta-attestation (trust-in-attesters) is supported but depth-capped
-- No infinite regress — termination condition is built in
-- **Write authority is enforced at the contract level — self-attestation is structurally prevented**
+## Core Problem
 
----
+ERC725Y data stored on a Universal Profile is only as trustworthy as the party writing it. If an agent writes attestation data to its own UP, the result is self-attestation — structurally indistinguishable from third-party attestation at the schema level. For trust registries and agent credentialing to hold, write authority must be separated from the subject.
 
-## Key Structure
+## ERC725Y Key Schema
 
-Attestations are stored at deterministic ERC725Y keys derived from:
+Attestation entries use a mapped key schema under a namespaced prefix:
 
 ```
-domain + attester + subject
+AttestationEntry:<keccak256(attester + subject + type)>
 ```
 
-**Key derivation:**
+Each value encodes:
+- `attester` — address of the attesting contract or agent
+- `subject` — UP address being attested
+- `type` — attestation category (e.g. `skill`, `session`, `governance_action`)
+- `value` — attested claim (bytes or encoded struct)
+- `timestamp` — block timestamp of settlement
+- `nonce` — replay protection
+
+Keys are written to the **subject's UP**, not the attester's.
+
+## LSP6 Write Authority Scoping
+
+The settlement contract must hold `SETDATA` permission on the subject UP, scoped to the attestation key prefix only.
+
+- Subject UP grants `SETDATA` to the settlement contract via LSP6 KeyManager
+- Permission is scoped using `AllowedERC725YDataKeys` — only the attestation namespace is writable
+- The attesting agent has **no direct write access** to the subject UP
+- The settlement contract validates attester eligibility before writing
+
+This means: an agent cannot write its own attestation entries, even if it controls its own UP with full permissions.
+
+## Settlement Contract
+
+The settlement contract is the sole authorized writer for attestation keys.
+
+### Responsibilities
+- Validate attester is registered and eligible
+- Validate subject UP exists and has granted write permission
+- Enforce rate limits and deduplication
+- Emit `AttestationSettled(attester, subject, type, keyHash)` on write
+- Write the encoded attestation value to the subject UP via LSP6
+
+### Governance Options
+
+**Option A — Immutable core:**
+- Settlement logic is immutable post-deployment
+- No admin key, no upgrade path
+- Attestation rules are locked at deploy time
+- Trust model: code is law, no operator risk
+
+**Option B — Timelock-governed:**
+- Settlement contract is upgradeable via a TimelockController
+- Minimum delay enforced (recommended: 7 days)
+- Upgrade proposals visible on-chain before execution
+- Trust model: transparent governance, slower attack surface
+
+---
+
+## Addendum: LSP3 Anchor + Immutable Core + Timelock Rotation
+
+*Added following discussion of write authority edge cases and the LUKSOAgent immutable-only objection.*
+
+### The LSP3 Anchor
+
+The settlement contract resolves the subject's LSP3 profile metadata at attestation time and stores a hash of it alongside the attestation entry. This creates a binding between the attestation and the profile state at the moment of writing.
 
 ```
-key = keccak256(abi.encodePacked(
-    bytes4(domain),      // 4-byte domain identifier
-    attester,            // address of the attesting agent
-    subject              // address of the subject being attested
-))
+AttestationEntry:<hash> → {
+  ...attestation fields...,
+  lsp3Anchor: keccak256(lsp3ProfileJSON)
+}
 ```
 
-**Value encoding (ABI-packed):**
+**Why this matters:** If a UP is transferred or the LSP3 profile is replaced, existing attestations remain on-chain but the anchor hash no longer matches the current profile state. Verifiers can detect profile drift and flag attestations as stale without invalidating the underlying data.
 
-| Field         | Type      | Size     | Description                                      |
-|---------------|-----------|----------|--------------------------------------------------|
-| `score`       | uint16    | 2 bytes  | Reputation score 0–1000. 0 = revoked (tombstone) |
-| `timestamp`   | uint40    | 5 bytes  | Unix timestamp of attestation                    |
-| `depth`       | uint8     | 1 byte   | Attestation depth (0 = direct, 1 = meta, 2 = max)|
-| `evidenceHash`| bytes32   | 32 bytes | Keccak256 hash of off-chain or on-chain evidence |
+This addresses the "wrong person, same address" attack — where a UP is sold or transferred and the new controller inherits prior attestations.
 
-Total value size: 40 bytes.
+### Objection: Immutable-Only is Insufficient
 
----
+The immutable core argument holds that removing all upgrade paths eliminates operator risk. This is correct for the settlement logic itself — the write rules should be immutable.
 
-## Domain Registry
+However, immutability alone does not solve:
+- **Attester registry rot**: eligible attesters need to be added/removed as the ecosystem evolves. A fully immutable contract with a fixed attester list becomes stale.
+- **Schema evolution**: attestation types will expand. New `type` values need to be recognized.
+- **Emergency response**: if a compromised attester floods the registry, there is no revocation path.
 
-Domains are 4-byte identifiers scoped to specialization areas:
+### Middle Path: Immutable Core, Timelock-Governed Registry
 
-| Domain       | Bytes       | Description                          |
-|--------------|-------------|--------------------------------------|
-| `governance` | `0x676f7600` | On-chain governance participation    |
-| `audit`      | `0x61756400` | Smart contract and PR auditing       |
-| `standards`  | `0x7374640` | LSP standards implementation quality |
-| `meta`       | `0x6d657461` | Meta-attestation (attester credibility) |
+The resolution is to split the contract into two components:
 
-New domains can be proposed via governance. Domain bytes should be human-readable ASCII where possible.
+**1. Immutable Settlement Core**
+- Write logic is immutable
+- Validates format, LSP6 permissions, nonce, and anchor hash
+- Cannot be upgraded
 
----
+**2. Timelock-Governed Attester Registry**
+- Separate contract holding the list of eligible attesters
+- Governed by TimelockController (minimum 7-day delay)
+- Settlement core reads from registry at attestation time
+- Registry changes are visible on-chain before taking effect
 
-## Write Authority
+This preserves the "code is law" property for write logic while allowing the attester set to evolve under transparent governance. An attacker compromising the registry governance still has a 7-day window during which the community can observe and respond.
 
-**Self-attestation is not a valid attestation.** The core problem: if an agent writes ERC725Y entries to its own UP, the data is self-reported. It may reflect real behavior, but the schema carries no enforcement guarantee. Any indexer treating self-written entries as authoritative is trusting the agent's word, not a verified on-chain event.
+### LSP3 Anchor Rotation
 
-### Enforced Write Authority Model
+When a subject updates their LSP3 profile legitimately, existing attestations become anchor-stale. Verifiers should:
+1. Check current LSP3 hash against stored anchor
+2. If mismatch: flag attestation as `PROFILE_DRIFT` — not invalid, but requiring re-attestation
+3. Attesters can re-issue against the new LSP3 state; old entries remain as historical record
 
-Attestation writes MUST originate from a **settlement contract** — a contract the subject cannot unilaterally control. The settlement contract is the only authorized writer of attestation data keys to any UP.
+This keeps the attestation history intact while making drift visible.
 
-**Rules:**
-1. The settlement contract holds LSP6 `SETDATA` permission on the subject's UP, scoped to attestation key prefixes only
-2. The attesting agent submits an attestation transaction to the settlement contract — it does not write to the subject's UP directly
-3. The settlement contract validates the attestation (domain, depth, anti-self-attestation check) and executes the `setData` call
-4. Attestation data written by any address other than the authorized settlement contract MUST be ignored by indexers
+### Summary of Trust Guarantees
 
-**Anti-self-attestation check (enforced in settlement contract):**
-```solidity
-require(msg.sender != subject, "Self-attestation not permitted");
-```
-
-**Key prefix scoping (LSP6 AllowedERC725YDataKeys):**
-```
-attestation key prefix: keccak256("AttestationSchema") & 0xFFFFFFFF00000000...
-```
-The settlement contract's LSP6 permission is restricted to this prefix. It cannot write arbitrary data to the UP.
-
----
-
-## Settlement Contract Governance
-
-The settlement contract is the trust anchor for the entire schema. Its governance model determines whether attestations are credible.
-
-### Requirements
-
-1. **No unilateral upgrade** — the settlement contract must be owned by a timelock or governance contract, not an EOA or single agent
-2. **Immutable core logic** — attestation validation rules (depth cap, anti-self-attestation, domain whitelist) should be in a non-upgradeable base contract
-3. **Governed parameter surface** — only domain registry additions, score normalization parameters, and seed trust additions go through governance
-4. **Auditable write log** — every `setData` call through the settlement contract emits an event with attester, subject, domain, score, and timestamp
-
-### Governance Architecture (Proposed)
-
-```
-CouncilGovernor
-    └── CouncilTimelock (minDelay: 48h)
-            └── AttestationSettlementContract (owner: Timelock)
-                    └── setData() on subject UPs (scoped LSP6 permission)
-```
-
-- Settlement contract parameters (domain whitelist, depth cap) are only changeable via timelock-executed governance proposal
-- Emergency pause (if implemented) requires a 2-of-N multisig with council members as signers — no single agent can pause unilaterally
-- Seed trust additions require a governance vote, not a contract owner call
-
-### LSP6 Permission Scoping for Settlement Contract
-
-The settlement contract address must be added as a controller on each participating UP with:
-- Permission: `SETDATA`
-- `AllowedERC725YDataKeys`: restricted to attestation key prefix only
-
-This is a one-time setup per UP. Agents opt in to the attestation system by granting this scoped permission. Opting out = revoking the permission.
-
----
-
-## Revocation (Tombstone Pattern)
-
-Revocations use the **same key and value schema** as attestations. No separate revocation mechanism.
-
-**Revocation rules:**
-- Write a new value at the same key with `score = 0`
-- `timestamp` MUST be greater than the original attestation timestamp
-- `evidenceHash` should reference the revocation event or reason
-- Indexers MUST take the entry with the **highest timestamp** as authoritative
-
-This means revocation is just data — same write path, same indexing logic. No special-case handling required.
-
----
-
-## Meta-Attestation
-
-Meta-attestations express trust in *attesters*, not subjects. They live in the `meta` domain (`0x6d657461`) and follow the same schema.
-
-**Semantics:**
-- A meta-attestation where `subject = attester_address` in domain `meta` expresses "I trust this agent's attestations"
-- Domain-scoped meta-attestations can be encoded by including domain in the `evidenceHash` preimage (pending schema extension)
-
-### Depth Cap and Decay
-
-To prevent infinite regress, attestation weight decays by depth:
-
-| Depth | Role                        | Weight Multiplier |
-|-------|-----------------------------|-------------------|
-| 0     | Direct attestation          | 100%              |
-| 1     | Meta-attestation (depth 1)  | 50%               |
-| 2     | Meta-attestation (depth 2)  | 25%               |
-| 3+    | Ignored                     | 0%                |
-
-**Depth is enforced at write time** — the `depth` field in the value encoding is set by the attester and verified by indexers. A depth-3 entry is valid on-chain but carries zero weight in scoring.
-
-### Example
-
-- Agent A (depth 0) directly attests Agent B in `audit` domain: score = 800
-- Agent C meta-attests Agent A in `meta` domain: depth = 1
-- Agent C's endorsement of Agent A's audit attestations carries 50% weight
-- If Agent D meta-attests Agent C: depth = 2, weight = 25%
-- Further recursion is discarded
-
----
-
-## Seed Trust (Verified Roots)
-
-The recursion needs a termination floor. Seed trust anchors the graph.
-
-**Seed trust sources (proposed):**
-1. **Council members** — agents with verified UP and council governance token
-2. **Verified contracts** — on-chain contracts that have passed a formal audit and emit attestation events
-3. **Governance-ratified roots** — addresses approved by a council vote and stored in the CouncilGovernor or a dedicated registry contract
-
-Seed trust agents have `depth = 0` by definition. Their attestations carry full weight regardless of whether anyone has meta-attested them.
-
-Seed trust additions and removals require governance proposal + timelock execution. No unilateral changes.
-
----
-
-## LSP26 as Signal Input
-
-The LSP26 follower graph (follow/unfollow events on LUKSO) can augment attestation scores as a secondary signal.
-
-**Limitations:**
-- Following is binary — no domain weighting in current LSP26 spec
-- Social popularity ≠ domain credibility
-- LSP26 alone is not sufficient for domain-scoped trust
-
-**Proposed use:** LSP26 follow count in a domain context is an input to score normalization, not a standalone attestation mechanism. Domain-weighted follower graphs would require an LSP26 extension or a parallel on-chain signal.
-
----
-
-## Indexer Behavior
-
-Indexers consuming this schema MUST:
-
-1. Derive the key deterministically from `(domain, attester, subject)`
-2. Read all entries at that key across block history
-3. Select the entry with the **highest timestamp** as the current attestation
-4. Apply depth-based weight decay when aggregating scores
-5. Ignore depth ≥ 3 entries for scoring purposes (still valid on-chain)
-6. Treat `score = 0` as revocation regardless of original score
-7. **Reject any attestation entry not written by the authorized settlement contract address**
-
----
-
-## Open Questions
-
-1. **Domain-scoped meta-attestation** — current schema encodes domain affinity in `evidenceHash` preimage. Should domain be a first-class field in the value encoding? Adds 4 bytes per entry.
-
-2. **LSP26 extension** — does domain-weighted following belong in an LSP26 update, a new LSP, or is it out of scope entirely? Following in domain X is semantically different from generic social following.
-
-3. **Score normalization** — 0–1000 is raw. Aggregated scores across multiple attesters need normalization. Weighted average? Median? Should the schema define the aggregation function or leave it to indexers?
-
-4. **Evidence portability** — `evidenceHash` is a keccak256 hash. What's the canonical format for the preimage? IPFS CID? ABI-encoded struct? Needs a companion standard.
-
-5. **Seed trust governance** — who ratifies the first set of seed trust agents? Bootstrapping problem. Proposal: initial seed set is set at contract deploy time by the deployer, then governance takes over.
-
-6. **URD triggering** — does the URD write attestation data to the *attester's* UP or the *subject's* UP? Writing to the attester's UP is safer (no unsolicited data on a subject's profile), but makes subject-centric queries harder.
-
-7. **Settlement contract deployment** — who deploys it, and under what initial ownership? Pre-governance bootstrapping requires a trusted deployer. Propose: deployer transfers ownership to timelock in the same transaction.
-
----
-
-## References
-
-- [LSP1 UniversalReceiver](https://docs.lukso.tech/standards/universal-profile/lsp1-universal-receiver/)
-- [LSP2 ERC725Y JSON Schema](https://docs.lukso.tech/standards/universal-profile/lsp2-erc725y-json-schema/)
-- [LSP6 KeyManager](https://docs.lukso.tech/standards/universal-profile/lsp6-key-manager/)
-- [LSP26 FollowerSystem](https://docs.lukso.tech/standards/universal-profile/lsp26-follower-system/)
-- [ERC725Y](https://eips.ethereum.org/EIPS/eip-725)
+| Property | Immutable Core Only | Immutable Core + Timelock Registry |
+|---|---|---|
+| Write logic tamper-proof | ✅ | ✅ |
+| Attester set evolvable | ❌ | ✅ |
+| Emergency attester revocation | ❌ | ✅ (7-day delay) |
+| Profile drift detectable | ✅ (with LSP3 anchor) | ✅ (with LSP3 anchor) |
+| Operator can silently modify writes | ❌ | ❌ |
+| Governance attack window visible | n/a | ✅ |
